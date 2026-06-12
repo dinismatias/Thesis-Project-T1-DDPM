@@ -125,6 +125,11 @@ except Exception:  # pragma: no cover
     except Exception as exc:
         raise ImportError("Could not import complex -> two-channel converter") from exc
 
+try:
+    from src.utils.metrics import compute_image_metrics
+except Exception as exc:  # pragma: no cover
+    raise ImportError("Could not import compute_image_metrics from src.utils.metrics") from exc
+
 
 # -----------------------------------------------------------------------------
 # Small utilities
@@ -356,28 +361,18 @@ def _mag_np(x_2ch: torch.Tensor):
 
 
 def _safe_metrics(x_2ch: torch.Tensor, target_2ch: Optional[torch.Tensor]) -> Dict[str, Optional[float]]:
+    """Magnitude metrics vs the target: NMSE / NRMSE / PSNR / SSIM / HFEN.
+
+    Delegates to the shared ``src.utils.metrics.compute_image_metrics`` so the
+    reconstruction loop, the CG-SENSE baseline, and eval_sweep all report the
+    same numbers. Returns a stable schema (values None) when no target exists.
+    """
     if target_2ch is None:
-        return {"nmse_mag": None, "nrmse_mag": None, "psnr_mag": None}
+        return compute_image_metrics(None, None, suffix="_mag")
 
-    x = torch.as_tensor(_ensure_bchw_2ch(x_2ch, name="x_metrics")).detach().float().cpu()
-    y = torch.as_tensor(_ensure_bchw_2ch(target_2ch, name="target_metrics")).detach().float().cpu()
-    xmag = torch.sqrt(x[:, 0] ** 2 + x[:, 1] ** 2)
-    ymag = torch.sqrt(y[:, 0] ** 2 + y[:, 1] ** 2)
-
-    err2 = torch.sum((xmag - ymag) ** 2)
-    ref2 = torch.sum(ymag ** 2).clamp_min(1e-12)
-    mse = torch.mean((xmag - ymag) ** 2).clamp_min(1e-12)
-    peak = torch.amax(ymag).clamp_min(1e-12)
-
-    nmse = err2 / ref2
-    nrmse = torch.sqrt(nmse)
-    psnr = 20.0 * torch.log10(peak / torch.sqrt(mse))
-
-    return {
-        "nmse_mag": float(nmse),
-        "nrmse_mag": float(nrmse),
-        "psnr_mag": float(psnr),
-    }
+    x = _ensure_bchw_2ch(x_2ch, name="x_metrics").detach().float().cpu()
+    y = _ensure_bchw_2ch(target_2ch, name="target_metrics").detach().float().cpu()
+    return compute_image_metrics(x, y, suffix="_mag")
 
 
 def _save_png_panel(
