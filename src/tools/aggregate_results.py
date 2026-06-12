@@ -214,6 +214,60 @@ def extract_run(run_dir: Path, *, best_metric: str, best_metric_mode: str) -> Op
     return row
 
 
+def _norm_key(af: Any, case: Any) -> Optional[tuple]:
+    """Normalize (acc_factor, case_index) into a stable join key."""
+    try:
+        af_s = str(af).strip()
+        af_s = "".join(c for c in af_s if c.isdigit()) or af_s
+        af_s = af_s.zfill(2)[-2:]
+        case_s = str(int(str(case).strip()))
+        return (af_s, case_s)
+    except Exception:
+        return None
+
+
+_BASELINE_METRICS = ["nmse_mag", "nrmse_mag", "psnr_mag", "ssim_mag", "hfen_mag"]
+
+
+def load_baselines(csv_path: Path) -> Dict[tuple, Dict[str, Any]]:
+    """Load baselines_summary.csv into {(af,case): {column: value}}."""
+    out: Dict[tuple, Dict[str, Any]] = {}
+    with csv_path.open("r", newline="", encoding="utf-8") as f:
+        for rec in csv.DictReader(f):
+            key = _norm_key(rec.get("acc_factor"), rec.get("case_index"))
+            if key is None:
+                continue
+            out[key] = {k: _safe_float(v) if any(k.endswith(m) for m in _BASELINE_METRICS)
+                        else v for k, v in rec.items()}
+    return out
+
+
+def merge_baselines(rows: List[Dict[str, Any]], baselines: Dict[tuple, Dict[str, Any]]) -> None:
+    """Attach zf_*/cgsense_* columns and DDPM-vs-baseline deltas onto each row."""
+    for row in rows:
+        key = _norm_key(row.get("acc_factor"), row.get("case_index"))
+        base = baselines.get(key) if key else None
+        if not base:
+            continue
+        for m in _BASELINE_METRICS:
+            row[f"zf_{m}"] = base.get(f"zf_{m}")
+            row[f"cgsense_{m}"] = base.get(f"cgsense_{m}")
+        row["cg_iters"] = base.get("cg_iters")
+
+        best_psnr = row.get("best_psnr_mag")
+        best_nmse = row.get("best_nmse_mag")
+        zf_psnr = base.get("zf_psnr_mag")
+        cg_psnr = base.get("cgsense_psnr_mag")
+        cg_nmse = base.get("cgsense_nmse_mag")
+        if best_psnr is not None and zf_psnr is not None:
+            row["best_psnr_gain_vs_zf_db"] = best_psnr - zf_psnr
+        if best_psnr is not None and cg_psnr is not None:
+            row["best_psnr_gain_vs_cgsense_db"] = best_psnr - cg_psnr
+        if best_nmse is not None and cg_nmse not in (None, 0):
+            # <1 means the diffusion recon beats CG-SENSE on NMSE.
+            row["best_nmse_ratio_vs_cgsense"] = best_nmse / cg_nmse
+
+
 def find_runs(root: Path) -> List[Path]:
     seen = set()
     runs: List[Path] = []
@@ -237,6 +291,9 @@ _PREFERRED_COLUMNS = [
     "best_nmse_mag", "best_psnr_mag", "best_ssim_mag", "best_hfen_mag", "best_dc_residual",
     "final_nmse_reduction_pct", "best_nmse_reduction_pct",
     "final_psnr_gain_db", "best_psnr_gain_db",
+    "zf_nmse_mag", "zf_psnr_mag", "zf_ssim_mag", "zf_hfen_mag",
+    "cgsense_nmse_mag", "cgsense_psnr_mag", "cgsense_ssim_mag", "cgsense_hfen_mag", "cg_iters",
+    "best_psnr_gain_vs_zf_db", "best_psnr_gain_vs_cgsense_db", "best_nmse_ratio_vs_cgsense",
     "metrics_source", "checkpoint", "run_dir",
 ]
 
@@ -261,6 +318,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--best_metric", default="nmse_mag",
                    help="Metric used to choose best cycle when only metrics.json exists.")
     p.add_argument("--best_metric_mode", default="auto", choices=["auto", "min", "max"])
+    p.add_argument("--baselines_csv", default=None,
+                   help="Optional baselines_summary.csv (from run_baselines.py) to merge "
+                        "zf_*/cgsense_* columns and DDPM-vs-baseline deltas onto each run.")
     return p
 
 
@@ -286,6 +346,16 @@ def main() -> None:
             best_str = f"{best:.4e}" if isinstance(best, float) else "NA"
             print(f"[OK] {row.get('run_name'):40s} best_nmse_mag={best_str} "
                   f"best_psnr_mag={row.get('best_psnr_mag')} src={row.get('metrics_source')}")
+
+    if args.baselines_csv:
+        bpath = Path(args.baselines_csv)
+        if not bpath.exists():
+            print(f"[WARN] --baselines_csv not found: {bpath}; skipping baseline merge.")
+        else:
+            baselines = load_baselines(bpath)
+            merge_baselines(rows, baselines)
+            matched = sum(1 for r in rows if r.get("cgsense_psnr_mag") is not None)
+            print(f"[INFO] Merged baselines for {matched}/{len(rows)} runs from {bpath}")
 
     write_csv(rows, out_csv)
     print(f"\n[DONE] Aggregated {len(rows)} runs -> {out_csv}")
