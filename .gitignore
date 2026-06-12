@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Data
+ChallengeData/
+*.mat
+*.h5
+*.hdf5
+*.nii
+*.nii.gz
+
+# Model checkpoints
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Outputs and logs
+outputs/
+logs/
+Images_report/
+images_report/
+
+# Backups / local copies
+arquive/
+thesis_baseline_backup/
+*_backup/
+backup/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
