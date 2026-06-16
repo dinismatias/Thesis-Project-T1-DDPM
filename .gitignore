@@ -35,3 +35,5 @@ backup/
 .DS_Store
 Thumbs.db
 .vscode/
+
+ChallengeData/

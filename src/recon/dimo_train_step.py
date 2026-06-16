@@ -204,6 +204,18 @@ def _q_sample(model: Any, x0: Tensor, t: Tensor, noise: Tensor) -> Tensor:
     return torch.sqrt(a_bar) * x0 + torch.sqrt(torch.clamp(1.0 - a_bar, min=0.0)) * noise
 
 
+def _autocast(device_type: str, enabled: bool):
+    """Return an autocast context manager across torch versions.
+
+    Prefers the modern ``torch.amp.autocast(device_type, ...)`` API (torch>=2.x)
+    and falls back to the deprecated ``torch.cuda.amp.autocast`` if needed.
+    """
+    try:
+        return torch.amp.autocast(device_type=device_type, enabled=enabled)
+    except (AttributeError, TypeError):  # pragma: no cover - old torch
+        return torch.cuda.amp.autocast(enabled=enabled)
+
+
 # -----------------------------------------------------------------------------
 # Conditioning and training step
 # -----------------------------------------------------------------------------
@@ -267,6 +279,8 @@ def _train_step_impl(
     device: torch.device,
     cond_mode: str = "none",
     max_grad_norm: Optional[float] = None,
+    use_amp: bool = False,
+    scaler: Optional[Any] = None,
 ) -> Tuple[Tensor, Dict[str, float]]:
     model.train()
 
@@ -287,15 +301,31 @@ def _train_step_impl(
     t = torch.randint(0, T, (B,), device=device, dtype=torch.long)
     eps = torch.randn_like(x0_n)
     x_t = _q_sample(model, x0_n, t, eps)
-    eps_pred = model(x_t, t, cond=cond)
-    loss = F.mse_loss(eps_pred, eps)
 
+    # Mixed precision is only meaningful on CUDA. Keep the forward and the loss
+    # inside the autocast region so the graph carries grad; the previous design
+    # (forward with optimizer=None elsewhere, then backward on a detached loss)
+    # is what raised "element 0 ... does not require grad".
+    autocast_enabled = bool(use_amp and device.type == "cuda")
+    with _autocast(device.type, autocast_enabled):
+        eps_pred = model(x_t, t, cond=cond)
+        loss = F.mse_loss(eps_pred, eps)
+
+    scaler_enabled = scaler is not None and bool(getattr(scaler, "is_enabled", lambda: False)())
     if optimizer is not None:
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if max_grad_norm is not None and max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
-        optimizer.step()
+        if scaler_enabled:
+            scaler.scale(loss).backward()
+            if max_grad_norm is not None and max_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if max_grad_norm is not None and max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
+            optimizer.step()
 
     stats = {
         "loss": float(loss.detach().cpu()),
@@ -334,6 +364,8 @@ def train_step(*args: Any, **kwargs: Any) -> Union[float, Tuple[Tensor, Dict[str
     device = kwargs.pop("device", None)
     cond_mode = kwargs.pop("cond_mode", "none")
     max_grad_norm = kwargs.pop("max_grad_norm", None)
+    use_amp = kwargs.pop("use_amp", False)
+    scaler = kwargs.pop("scaler", None)
 
     if kwargs:
         # Do not silently swallow typos in training code.
@@ -350,6 +382,8 @@ def train_step(*args: Any, **kwargs: Any) -> Union[float, Tuple[Tensor, Dict[str
         device=device,
         cond_mode=cond_mode,
         max_grad_norm=max_grad_norm,
+        use_amp=use_amp,
+        scaler=scaler,
     )
 
     if return_stats:

@@ -1,0 +1,222 @@
+From 1461b081719a0b1a652417736bacd937957b5da0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 16 Jun 2026 21:30:22 +0000
+Subject: [PATCH] Fix AMP training path: backward a grad-carrying loss
+
+The --amp path in train_dimo.py ran the forward with optimizer=None
+(which returns a detached loss) and then called scaler.scale(loss).backward(),
+raising 'element 0 of tensors does not require grad and does not have a grad_fn'.
+
+Move mixed precision into dimo_train_step._train_step_impl, where the forward
+and backward live: the model call + MSE loss now run inside an autocast region
+and the GradScaler scales/steps a loss that actually carries grad. train_step
+accepts use_amp/scaler kwargs; _train_step_compat delegates to it instead of
+doing a manual backward on a detached loss.
+
+Also switch to the modern torch.amp.GradScaler/autocast API (with fallbacks)
+to clear the deprecation warnings.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LrBCVy1GtjtrxAcP4PL2Xa
+---
+ src/recon/dimo_train_step.py | 46 ++++++++++++++++++++---
+ src/recon/train_dimo.py      | 71 +++++++++++++++++++++---------------
+ 2 files changed, 82 insertions(+), 35 deletions(-)
+
+diff --git a/src/recon/dimo_train_step.py b/src/recon/dimo_train_step.py
+index 8f5fc3d..bf3a5e6 100644
+--- a/src/recon/dimo_train_step.py
++++ b/src/recon/dimo_train_step.py
+@@ -204,6 +204,18 @@ def _q_sample(model: Any, x0: Tensor, t: Tensor, noise: Tensor) -> Tensor:
+     return torch.sqrt(a_bar) * x0 + torch.sqrt(torch.clamp(1.0 - a_bar, min=0.0)) * noise
+ 
+ 
++def _autocast(device_type: str, enabled: bool):
++    """Return an autocast context manager across torch versions.
++
++    Prefers the modern ``torch.amp.autocast(device_type, ...)`` API (torch>=2.x)
++    and falls back to the deprecated ``torch.cuda.amp.autocast`` if needed.
++    """
++    try:
++        return torch.amp.autocast(device_type=device_type, enabled=enabled)
++    except (AttributeError, TypeError):  # pragma: no cover - old torch
++        return torch.cuda.amp.autocast(enabled=enabled)
++
++
+ # -----------------------------------------------------------------------------
+ # Conditioning and training step
+ # -----------------------------------------------------------------------------
+@@ -267,6 +279,8 @@ def _train_step_impl(
+     device: torch.device,
+     cond_mode: str = "none",
+     max_grad_norm: Optional[float] = None,
++    use_amp: bool = False,
++    scaler: Optional[Any] = None,
+ ) -> Tuple[Tensor, Dict[str, float]]:
+     model.train()
+ 
+@@ -287,15 +301,31 @@ def _train_step_impl(
+     t = torch.randint(0, T, (B,), device=device, dtype=torch.long)
+     eps = torch.randn_like(x0_n)
+     x_t = _q_sample(model, x0_n, t, eps)
+-    eps_pred = model(x_t, t, cond=cond)
+-    loss = F.mse_loss(eps_pred, eps)
+ 
++    # Mixed precision is only meaningful on CUDA. Keep the forward and the loss
++    # inside the autocast region so the graph carries grad; the previous design
++    # (forward with optimizer=None elsewhere, then backward on a detached loss)
++    # is what raised "element 0 ... does not require grad".
++    autocast_enabled = bool(use_amp and device.type == "cuda")
++    with _autocast(device.type, autocast_enabled):
++        eps_pred = model(x_t, t, cond=cond)
++        loss = F.mse_loss(eps_pred, eps)
++
++    scaler_enabled = scaler is not None and bool(getattr(scaler, "is_enabled", lambda: False)())
+     if optimizer is not None:
+         optimizer.zero_grad(set_to_none=True)
+-        loss.backward()
+-        if max_grad_norm is not None and max_grad_norm > 0:
+-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
+-        optimizer.step()
++        if scaler_enabled:
++            scaler.scale(loss).backward()
++            if max_grad_norm is not None and max_grad_norm > 0:
++                scaler.unscale_(optimizer)
++                torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
++            scaler.step(optimizer)
++            scaler.update()
++        else:
++            loss.backward()
++            if max_grad_norm is not None and max_grad_norm > 0:
++                torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
++            optimizer.step()
+ 
+     stats = {
+         "loss": float(loss.detach().cpu()),
+@@ -334,6 +364,8 @@ def train_step(*args: Any, **kwargs: Any) -> Union[float, Tuple[Tensor, Dict[str
+     device = kwargs.pop("device", None)
+     cond_mode = kwargs.pop("cond_mode", "none")
+     max_grad_norm = kwargs.pop("max_grad_norm", None)
++    use_amp = kwargs.pop("use_amp", False)
++    scaler = kwargs.pop("scaler", None)
+ 
+     if kwargs:
+         # Do not silently swallow typos in training code.
+@@ -350,6 +382,8 @@ def train_step(*args: Any, **kwargs: Any) -> Union[float, Tuple[Tensor, Dict[str
+         device=device,
+         cond_mode=cond_mode,
+         max_grad_norm=max_grad_norm,
++        use_amp=use_amp,
++        scaler=scaler,
+     )
+ 
+     if return_stats:
+diff --git a/src/recon/train_dimo.py b/src/recon/train_dimo.py
+index 030cb42..13df6a9 100644
+--- a/src/recon/train_dimo.py
++++ b/src/recon/train_dimo.py
+@@ -258,6 +258,18 @@ def _make_dataset_group(
+     return datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
+ 
+ 
++def _make_grad_scaler(*, enabled: bool):
++    """Create a GradScaler across torch versions.
++
++    Prefers the modern ``torch.amp.GradScaler('cuda', ...)`` API and falls back
++    to the deprecated ``torch.cuda.amp.GradScaler`` on older torch.
++    """
++    try:
++        return torch.amp.GradScaler("cuda", enabled=enabled)
++    except (AttributeError, TypeError):  # pragma: no cover - old torch
++        return torch.cuda.amp.GradScaler(enabled=enabled)
++
++
+ def _train_step_compat(
+     *,
+     model: torch.nn.Module,
+@@ -266,44 +278,45 @@ def _train_step_compat(
+     device: torch.device,
+     cond_mode: str,
+     use_amp: bool = False,
+-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
++    scaler: Optional[Any] = None,
+ ) -> Tuple[torch.Tensor, Dict[str, float]]:
+     """Call project train_step across the different signatures used in the repo.
+ 
+-    Preferred modern signature:
+-        train_step(model=model, batch=batch, optimizer=optimizer, device=device, cond_mode=cond_mode)
++    Preferred modern signature (owns its own forward/backward/step and supports
++    AMP via the ``use_amp``/``scaler`` kwargs):
++        train_step(model=model, batch=batch, optimizer=optimizer, device=device,
++                   cond_mode=cond_mode, use_amp=use_amp, scaler=scaler)
+ 
+-    Older signature:
+-        train_step(model, batch, optimizer, device, cond_mode=cond_mode)
++    AMP is delegated to train_step on purpose: the loss graph and the backward
++    pass live there, so the scaler can scale a loss that actually carries grad.
++    The previous design did the forward with optimizer=None and then tried to
++    backward a detached loss, which raised "element 0 ... does not require grad".
+ 
+-    AMP path is implemented here only when the imported train_step exposes a pure
+-    forward loss with optimizer=None. If your local train_step owns backward/step,
+-    this still falls back cleanly.
++    Older train_step builds (no use_amp/scaler, or no cond_mode) are handled by
++    the TypeError fallbacks. Those raise before any optimizer side effects, so a
++    retry never double-steps.
+     """
+-    if use_amp and optimizer is not None:
+-        # Try to obtain a loss without stepping, then do the AMP backward here.
+-        try:
+-            with torch.cuda.amp.autocast(enabled=True):
+-                out = train_step(model=model, batch=batch, optimizer=None, device=device, cond_mode=cond_mode)
+-            loss, stats = _parse_train_step_output(out)
+-            optimizer.zero_grad(set_to_none=True)
+-            assert scaler is not None
+-            scaler.scale(loss).backward()
+-            scaler.step(optimizer)
+-            scaler.update()
+-            return loss.detach(), stats
+-        except TypeError:
+-            # Fall back to native train_step below.
+-            pass
++    # Modern signature with AMP support.
++    try:
++        out = train_step(model=model, batch=batch, optimizer=optimizer, device=device,
++                         cond_mode=cond_mode, use_amp=use_amp, scaler=scaler)
++        return _parse_train_step_output(out)
++    except TypeError:
++        pass
+ 
++    # train_step that knows cond_mode but not the AMP kwargs (no mixed precision).
+     try:
+         out = train_step(model=model, batch=batch, optimizer=optimizer, device=device, cond_mode=cond_mode)
++        return _parse_train_step_output(out)
+     except TypeError:
+-        try:
+-            out = train_step(model, batch, optimizer, device, cond_mode=cond_mode)
+-        except TypeError:
+-            # Very old train_step did not know cond_mode.
+-            out = train_step(model, batch, optimizer, device)
++        pass
++
++    # Legacy positional signatures.
++    try:
++        out = train_step(model, batch, optimizer, device, cond_mode=cond_mode)
++    except TypeError:
++        # Very old train_step did not know cond_mode.
++        out = train_step(model, batch, optimizer, device)
+     return _parse_train_step_output(out)
+ 
+ 
+@@ -538,7 +551,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
+         model = torch.compile(model)  # type: ignore[assignment]
+ 
+     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=0.0)
+-    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
++    scaler = _make_grad_scaler(enabled=(args.amp and device.type == "cuda"))
+ 
+     config: Dict[str, Any] = {
+         "acc_roots": [str(x) for x in roots],
+-- 
+2.43.0
+

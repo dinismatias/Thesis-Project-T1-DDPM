@@ -258,6 +258,18 @@ def _make_dataset_group(
     return datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
 
 
+def _make_grad_scaler(*, enabled: bool):
+    """Create a GradScaler across torch versions.
+
+    Prefers the modern ``torch.amp.GradScaler('cuda', ...)`` API and falls back
+    to the deprecated ``torch.cuda.amp.GradScaler`` on older torch.
+    """
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):  # pragma: no cover - old torch
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 def _train_step_compat(
     *,
     model: torch.nn.Module,
@@ -266,44 +278,45 @@ def _train_step_compat(
     device: torch.device,
     cond_mode: str,
     use_amp: bool = False,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    scaler: Optional[Any] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Call project train_step across the different signatures used in the repo.
 
-    Preferred modern signature:
-        train_step(model=model, batch=batch, optimizer=optimizer, device=device, cond_mode=cond_mode)
+    Preferred modern signature (owns its own forward/backward/step and supports
+    AMP via the ``use_amp``/``scaler`` kwargs):
+        train_step(model=model, batch=batch, optimizer=optimizer, device=device,
+                   cond_mode=cond_mode, use_amp=use_amp, scaler=scaler)
 
-    Older signature:
-        train_step(model, batch, optimizer, device, cond_mode=cond_mode)
+    AMP is delegated to train_step on purpose: the loss graph and the backward
+    pass live there, so the scaler can scale a loss that actually carries grad.
+    The previous design did the forward with optimizer=None and then tried to
+    backward a detached loss, which raised "element 0 ... does not require grad".
 
-    AMP path is implemented here only when the imported train_step exposes a pure
-    forward loss with optimizer=None. If your local train_step owns backward/step,
-    this still falls back cleanly.
+    Older train_step builds (no use_amp/scaler, or no cond_mode) are handled by
+    the TypeError fallbacks. Those raise before any optimizer side effects, so a
+    retry never double-steps.
     """
-    if use_amp and optimizer is not None:
-        # Try to obtain a loss without stepping, then do the AMP backward here.
-        try:
-            with torch.cuda.amp.autocast(enabled=True):
-                out = train_step(model=model, batch=batch, optimizer=None, device=device, cond_mode=cond_mode)
-            loss, stats = _parse_train_step_output(out)
-            optimizer.zero_grad(set_to_none=True)
-            assert scaler is not None
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            return loss.detach(), stats
-        except TypeError:
-            # Fall back to native train_step below.
-            pass
+    # Modern signature with AMP support.
+    try:
+        out = train_step(model=model, batch=batch, optimizer=optimizer, device=device,
+                         cond_mode=cond_mode, use_amp=use_amp, scaler=scaler)
+        return _parse_train_step_output(out)
+    except TypeError:
+        pass
 
+    # train_step that knows cond_mode but not the AMP kwargs (no mixed precision).
     try:
         out = train_step(model=model, batch=batch, optimizer=optimizer, device=device, cond_mode=cond_mode)
+        return _parse_train_step_output(out)
     except TypeError:
-        try:
-            out = train_step(model, batch, optimizer, device, cond_mode=cond_mode)
-        except TypeError:
-            # Very old train_step did not know cond_mode.
-            out = train_step(model, batch, optimizer, device)
+        pass
+
+    # Legacy positional signatures.
+    try:
+        out = train_step(model, batch, optimizer, device, cond_mode=cond_mode)
+    except TypeError:
+        # Very old train_step did not know cond_mode.
+        out = train_step(model, batch, optimizer, device)
     return _parse_train_step_output(out)
 
 
@@ -476,9 +489,7 @@ def _resolve_roots_and_afs(args: argparse.Namespace) -> Tuple[List[Path], List[s
                 afs.append(digits[-2:].zfill(2) if digits else str(args.acc_factor).zfill(2))
         return roots, afs
 
-    if args.acc_root is None:
-        raise ValueError("Provide either --acc_root or --acc_roots")
-    return [Path(args.acc_root)], [str(args.acc_factor).zfill(2)]
+    OMAS
 
 
 def main(args: Optional[argparse.Namespace] = None) -> None:
@@ -538,7 +549,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         model = torch.compile(model)  # type: ignore[assignment]
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=0.0)
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
+    scaler = _make_grad_scaler(enabled=(args.amp and device.type == "cuda"))
 
     config: Dict[str, Any] = {
         "acc_roots": [str(x) for x in roots],
