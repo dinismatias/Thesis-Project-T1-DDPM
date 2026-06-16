@@ -1,5 +1,14 @@
-# src/test/run_alternating_recon.py
+# src/test/run_alternating_recon_legacy.py
 """
+DEPRECATED. Kept only for reference.
+
+The canonical, maintained reconstruction script is now
+``src/test/run_alternating_recon.py`` (formerly run_alternating_recon_cycle.py),
+which is a strict superset of this file: it adds best-cycle reporting
+(``--best_metric``, ``metrics_summary.json``, ``best_cycle.pt``) on top of the
+identical schedule-driven prior + DDIM-with-DC loop. Do not run this legacy
+file for new experiments; it exists so the previous behaviour stays inspectable.
+
 Alternating prior–data-consistency reconstruction for the T1_DDPM / DiMo pipeline.
 
 Algorithm
@@ -63,7 +72,6 @@ import argparse
 import json
 import math
 import random
-import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -149,60 +157,6 @@ def _jsonable(x: Any) -> Any:
     if isinstance(x, (list, tuple)):
         return [_jsonable(v) for v in x]
     return str(x)
-
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-def _metric_mode(metric_name: str, requested: str = "auto") -> str:
-    requested = str(requested).lower()
-
-    if requested in {"min", "max"}:
-        return requested
-
-    metric = str(metric_name).lower()
-
-    if "psnr" in metric or "ssim" in metric:
-        return "max"
-
-    return "min"
-
-
-def _is_better(candidate: Any, current_best: Any, mode: str) -> bool:
-    c = _safe_float(candidate)
-    b = _safe_float(current_best)
-
-    if c is None:
-        return False
-
-    if b is None:
-        return True
-
-    if mode == "max":
-        return c > b
-
-    return c < b
-
-
-def _compact_metric_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Remove heavy nested fields before writing summary JSON/CSV-friendly data.
-    """
-    out: Dict[str, Any] = {}
-
-    for k, v in row.items():
-        if k in {"stage2_residual_log"}:
-            continue
-        if isinstance(v, (dict, list)):
-            continue
-        out[k] = v
-
-    return out
 
 
 def _adjoint(sense_op: Any, kspace_complex: torch.Tensor, mask_bhw: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -643,31 +597,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save_png", action="store_true")
     p.add_argument("--log_residuals", action="store_true")
-
-    p.add_argument(
-        "--best_metric",
-        default="nmse_mag",
-        help="Metric used to choose the best cycle. Common choices: nmse_mag, psnr_mag, dc_residual.",
-    )
-    p.add_argument(
-        "--best_metric_mode",
-        default="auto",
-        choices=["auto", "min", "max"],
-        help="auto=min for NMSE/NRMSE/residual, max for PSNR/SSIM.",
-    )
-    p.add_argument(
-        "--save_best_cycle",
-        action="store_true",
-        default=True,
-        help="Copy the best cycle output to best_cycle.pt/png when possible.",
-    )
-    p.add_argument(
-        "--no_save_best_cycle",
-        action="store_false",
-        dest="save_best_cycle",
-        help="Disable saving best_cycle.pt/png.",
-    )
-
     p.add_argument("--out_dir", default="outputs/alternating_recon")
 
     return p
@@ -791,11 +720,6 @@ def main() -> None:
 
     metrics: List[Dict[str, Any]] = []
 
-    best_metric_mode = _metric_mode(args.best_metric, args.best_metric_mode)
-    best_cycle_idx: Optional[int] = None
-    best_cycle_row: Optional[Dict[str, Any]] = None
-    best_metric_value: Optional[float] = None
-
     # Initial state: normalized zero-filled reconstruction.
     x_norm = zf_norm.clone()
 
@@ -899,13 +823,6 @@ def main() -> None:
             **m,
         }
         metrics.append(row)
-
-        candidate_value = row.get(args.best_metric)
-
-        if _is_better(candidate_value, best_metric_value, best_metric_mode):
-            best_metric_value = _safe_float(candidate_value)
-            best_cycle_idx = int(cycle)
-            best_cycle_row = _compact_metric_row(row)
 
         if args.log_residuals:
             nmse_str = "nan" if m["nmse_mag"] is None else f"{m['nmse_mag']:.6e}"
@@ -1011,62 +928,6 @@ def main() -> None:
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(_jsonable(metrics), f, indent=2)
 
-    initial_row = _compact_metric_row(metrics[0]) if metrics else {}
-    final_row = _compact_metric_row(metrics[-1]) if metrics else {}
-
-    if best_cycle_row is None and len(metrics) > 1:
-        best_cycle_idx = int(metrics[-1].get("cycle", int(args.cycles)))
-        best_cycle_row = _compact_metric_row(metrics[-1])
-        best_metric_value = _safe_float(best_cycle_row.get(args.best_metric))
-
-    metrics_summary = {
-        "initial": initial_row,
-        "final_cycle": final_row,
-        "best_cycle": {
-            "best_metric": args.best_metric,
-            "best_metric_mode": best_metric_mode,
-            "best_metric_value": best_metric_value,
-            "best_cycle": best_cycle_idx,
-            "best_cycle_metrics": best_cycle_row,
-        },
-        "meta": {
-            "ckpt": args.ckpt,
-            "acc_root": args.acc_root,
-            "acc_factor": acc_factor,
-            "index": int(args.index),
-            "cycles": int(args.cycles),
-            "cond_mode": cond_mode,
-            "target_mode": target_mode,
-            "scale_mode_effective": scale_mode,
-            "prior_strength_schedule": prior_strength_schedule,
-            "prior_steps_schedule": prior_steps_schedule,
-            "stage2_strength_schedule": stage2_strength_schedule,
-            "stage2_steps_schedule": stage2_steps_schedule,
-            "dc_mode": args.dc_mode,
-            "best_metric": args.best_metric,
-            "best_metric_mode": best_metric_mode,
-        },
-    }
-
-    with open(out_dir / "metrics_summary.json", "w", encoding="utf-8") as f:
-        json.dump(_jsonable(metrics_summary), f, indent=2)
-
-    if args.save_best_cycle and best_cycle_idx is not None:
-        src_pt = out_dir / f"cycle_{best_cycle_idx:02d}.pt"
-        dst_pt = out_dir / "best_cycle.pt"
-
-        if src_pt.exists():
-            shutil.copyfile(src_pt, dst_pt)
-
-        src_png = out_dir / f"cycle_{best_cycle_idx:02d}.png"
-        dst_png = out_dir / "best_cycle.png"
-
-        if src_png.exists():
-            shutil.copyfile(src_png, dst_png)
-
-        with open(out_dir / "best_cycle_metrics.json", "w", encoding="utf-8") as f:
-            json.dump(_jsonable(metrics_summary["best_cycle"]), f, indent=2)
-
     if args.save_png:
         _save_png_panel(
             out_png=out_dir / "alternating_recon_final.png",
@@ -1080,8 +941,6 @@ def main() -> None:
     print(f"\n[INFO] Saved outputs to: {out_dir}")
     print(f"[INFO] Final file: {out_dir / 'alternating_recon_output.pt'}")
     print(f"[INFO] Metrics: {out_dir / 'metrics.json'}")
-    print(f"[INFO] Metrics summary: {out_dir / 'metrics_summary.json'}")
-    print(f"[INFO] Best cycle: {best_cycle_idx} using {args.best_metric}={best_metric_value}")
     print(f"[INFO] scale_mode={scale_mode} scale_mean={float(scale_2ch.mean().detach().cpu()):.6g}")
 
 

@@ -63,6 +63,11 @@ except Exception:  # pragma: no cover
     from complex_ops import ch2_to_complex, complex_to_2ch  # type: ignore
 
 try:
+    from src.utils.metrics import compute_image_metrics
+except Exception:  # pragma: no cover
+    from metrics import compute_image_metrics  # type: ignore
+
+try:
     from src.recon.dimo_dataset import DimoKspaceDataset as _Dataset
 except Exception:  # pragma: no cover
     try:
@@ -236,12 +241,20 @@ def compute_basic_metrics_mag(*, x_hat_2ch: Tensor, x_ref_2ch: Tensor, eps: floa
     den = torch.sum(xr_mag * xr_mag, dim=(-2, -1)).clamp_min(eps)
     nmse = num / den
 
-    return {
+    out = {
         "psnr_mean": float(psnr.mean().item()),
         "psnr_min": float(psnr.min().item()),
         "psnr_max": float(psnr.max().item()),
         "nmse_mean": float(nmse.mean().item()),
     }
+
+    # Add SSIM and HFEN (batch-mean) from the shared metrics util so the
+    # baseline reports the same quantities as the diffusion reconstruction.
+    shared = compute_image_metrics(x_hat_2ch, x_ref_2ch, suffix="_mean")
+    out["ssim_mean"] = shared["ssim_mean"]
+    out["hfen_mean"] = shared["hfen_mean"]
+    out["nrmse_mean"] = shared["nrmse_mean"]
+    return out
 
 
 # -----------------------------------------------------------------------------
